@@ -1,6 +1,6 @@
 # RustCloud
 
-A small, Windows-first SoundCloud desktop client. RustCloud opens SoundCloud in WebView2, blocks many advertising requests, and adds a playlist sidebar, optional full-playlist shuffle, and customizable themes. The app includes an original grayscale cloud-and-waveform icon.
+A small, Windows-first SoundCloud desktop client. RustCloud opens SoundCloud in WebView2, blocks many advertising requests, and adds a playlist sidebar, optional full-playlist shuffle, and customizable themes. The app includes an original monochrome waveform icon.
 
 ## Requirements
 
