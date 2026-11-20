@@ -7,12 +7,25 @@ license = "MIT"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:webview2-com", "dep:windows", "dep:winit", "dep:wry"]
+desktop = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:image",
+    "dep:ureq",
+    "dep:webview2-com",
+    "dep:windows",
+    "dep:winit",
+    "dep:wry",
+]
 
 [dependencies]
-url = "2"
+adblock = { version = "0.13.6", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 
 [target.'cfg(windows)'.dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+ureq = { version = "3.5.2", optional = true }
 webview2-com = { version = "0.39", optional = true }
 windows = { version = "0.62", features = ["Win32_System_Com"], optional = true }
 winit = { version = "0.30", optional = true }
@@ -22,3 +35,6 @@ wry = { version = "0.57", default-features = false, features = ["os-webview"], o
 name = "rustcloud"
 path = "src/main.rs"
 required-features = ["desktop"]
+
+[build-dependencies]
+winres = "0.1"
