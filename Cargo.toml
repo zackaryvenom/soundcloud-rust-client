@@ -1,0 +1,24 @@
+[package]
+name = "rustcloud"
+version = "0.1.0"
+edition = "2021"
+description = "A small SoundCloud desktop client prototype with WebView2 request blocking"
+license = "MIT"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:webview2-com", "dep:windows", "dep:winit", "dep:wry"]
+
+[dependencies]
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = { version = "0.39", optional = true }
+windows = { version = "0.62", features = ["Win32_System_Com"], optional = true }
+winit = { version = "0.30", optional = true }
+wry = { version = "0.57", default-features = false, features = ["os-webview"], optional = true }
+
+[[bin]]
+name = "rustcloud"
+path = "src/main.rs"
+required-features = ["desktop"]
