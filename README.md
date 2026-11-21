@@ -30,7 +30,7 @@ Debug runs via `cargo run` keep the PowerShell console available for logs. Relea
 
 On startup, RustCloud immediately uses cached Ghostery filter lists (or built-in rules if no cache exists), then refreshes stale lists in the background. Updated rules take effect without restarting. Lists are cached for 24 hours under `%LOCALAPPDATA%\RustCloud`.
 
-Use **Library** in the top-left corner to open a searchable sidebar for your created and liked/saved playlists. It reads the lists from SoundCloud in the existing signed-in WebView session; no separate login is needed. The playlist snapshot is cached locally; use the refresh button to look for changes. Click a playlist to open it.
+Use **Library** in the top-left corner to open a searchable sidebar for your created and liked/saved playlists, with playlist artwork and pinning. It reads the lists from SoundCloud in the existing signed-in WebView session; no separate login is needed. The playlist snapshot is cached locally; use the refresh button to look for changes. Click a playlist to open it.
 
 Press **F1** to open settings. Choose **Default** to restore SoundCloud's original look, or pick **Midnight Glass**, **Neon Pulse**, **Warm Vinyl**, **Forest Glow**, **Rose Quartz**, or **Ocean Breeze** to theme the page background, text, player controls, and progress bar with a subtle matching glow and a distinct font for each theme. **Custom Glass** lets you choose an accent color and font with the Midnight Glass style. RustCloud's panels follow the theme too. Player controls use monochrome styling. Theme, accent, and custom font choices survive in-app navigation.
 

@@ -644,7 +644,7 @@ mod desktop {
                 #resize-north, #resize-north-east, #resize-north-west { display:none; }
                 #window-titlebar-drag {
                     display:flex; flex:1; align-items:center; gap:9px;
-                    min-width:0; cursor:default;
+                    min-width:0; cursor:default; touch-action:none;
                 }
                 #window-titlebar-controls { position:relative; z-index:7; display:flex; }
                 .window-control {
@@ -1399,8 +1399,17 @@ mod desktop {
                 }
             });
         });
+        let lastTitlebarDragPost = 0;
         titlebarDrag.addEventListener('pointerdown', event => {
-            if (event.button === 0) post({ type: 'windowControl', action: 'drag' });
+            if (event.button === 0) {
+                event.preventDefault();
+                event.stopPropagation();
+                const now = Date.now();
+                if (now - lastTitlebarDragPost >= 100) {
+                    lastTitlebarDragPost = now;
+                    post({ type: 'windowControl', action: 'drag' });
+                }
+            }
         });
         titlebarDrag.addEventListener('dblclick', () => {
             post({ type: 'windowControl', action: 'toggleMaximize' });
@@ -1691,6 +1700,52 @@ mod desktop {
             };
             const readItems = doc => {
                 const results = new Map();
+                const artworkByUrl = new Map();
+                for (const script of doc.querySelectorAll('script')) {
+                    const source = script.textContent || '';
+                    if (!source.includes('/sets/') || !source.includes('artwork_url')) continue;
+                    try {
+                        const collect = value => {
+                            if (!value || typeof value !== 'object') return;
+                            if (Array.isArray(value)) {
+                                value.forEach(collect);
+                                return;
+                            }
+                            if (typeof value.permalink_url === 'string' &&
+                                typeof value.artwork_url === 'string' &&
+                                value.permalink_url.includes('/sets/')) {
+                                try {
+                                    const url = new URL(value.permalink_url, doc.location.href);
+                                    artworkByUrl.set(
+                                        `${url.origin}${url.pathname.replace(/\/$/, '')}`,
+                                        value.artwork_url
+                                    );
+                                } catch (_) {}
+                            }
+                            Object.values(value).forEach(collect);
+                        };
+                        collect(JSON.parse(source));
+                    } catch (_) {
+                        const permalinkMatches = [
+                            ...source.matchAll(/["'](?:permalink_url|url)["']\s*:\s*["']([^"']*\/sets\/[^"']+)["']/g)
+                        ];
+                        for (const match of permalinkMatches) {
+                            const nearby = source.slice(
+                                Math.max(0, match.index - 100),
+                                Math.min(source.length, match.index + 1500)
+                            );
+                            const artworkMatch = nearby.match(/["']artwork_url["']\s*:\s*["']([^"']+)["']/);
+                            if (!artworkMatch) continue;
+                            try {
+                                const url = new URL(match[1], doc.location.href);
+                                artworkByUrl.set(
+                                    `${url.origin}${url.pathname.replace(/\/$/, '')}`,
+                                    artworkMatch[1]
+                                );
+                            } catch (_) {}
+                        }
+                    }
+                }
                 for (const link of doc.querySelectorAll('a[href]')) {
                     let url;
                     try {
@@ -1720,7 +1775,9 @@ mod desktop {
                         row.querySelector('img[src], img[data-src], img[srcset], picture source[srcset]'),
                         ...row.querySelectorAll('[style*="background-image"]')
                     ];
+                    artwork = artworkByUrl.get(key) || '';
                     for (const candidate of candidates) {
+                        if (artwork) break;
                         if (!candidate) continue;
                         if (candidate.matches && candidate.matches('source')) {
                             artwork = candidate.srcset || candidate.getAttribute('srcset') || '';
@@ -1821,14 +1878,127 @@ mod desktop {
                     kind: item.kind,
                     title: item.title,
                     url: item.url,
-                    artwork: typeof item.artwork === 'string' &&
-                        item.artwork.startsWith('https://') ? item.artwork : ''
+                    artwork: isUsablePlaylistArtwork(normalizeArtworkUrl(item.artwork))
+                        ? normalizeArtworkUrl(item.artwork)
+                        : ''
                 }));
             } catch (error) {
                 console.warn('[RustCloud] Could not read the playlist cache:', error);
                 return [];
             }
         };
+        const normalizeArtworkUrl = value => {
+            if (typeof value !== 'string') return '';
+            let url = value.trim().replace(/^http:\/\//, 'https://');
+            if (!url.startsWith('https://')) return '';
+            if (url.includes('i1.sndcdn.com')) {
+                url = url.replace(/-(?:large|t\d+x\d+|crop|original)\.(?:jpg|png|jpeg)(?:\?.*)?$/i,
+                    '-t500x500.jpg');
+            }
+            return url;
+        };
+        const isUsablePlaylistArtwork = value => {
+            if (!value || typeof value !== 'string') return false;
+            try {
+                const url = new URL(normalizeArtworkUrl(value));
+                return url.protocol === 'https:' &&
+                    (url.hostname === 'i1.sndcdn.com' || url.hostname.endsWith('.sndcdn.com'));
+            } catch (_) {
+                return false;
+            }
+        };
+        const findArtworkInHtml = html => {
+            if (!html) return '';
+            const parsed = new DOMParser().parseFromString(html, 'text/html');
+            const meta = [
+                parsed.querySelector('meta[property="og:image"]'),
+                parsed.querySelector('meta[name="twitter:image"]'),
+                parsed.querySelector('meta[name="twitter:image:src"]')
+            ].find(element => element && element.content);
+            if (meta) {
+                const artwork = normalizeArtworkUrl(meta.content);
+                if (isUsablePlaylistArtwork(artwork)) return artwork;
+            }
+            for (const script of parsed.querySelectorAll('script')) {
+                const source = script.textContent || '';
+                const matches = [
+                    ...source.matchAll(/["'](?:artwork_url|image)["']\s*:\s*["']([^"']+)["']/g),
+                    ...source.matchAll(/(?:artwork_url|image)["']?\s*[:=]\s*["']([^"']+)["']/g)
+                ];
+                for (const match of matches) {
+                    const artwork = normalizeArtworkUrl(
+                        match[1].replace(/\\u0026/g, '&').replace(/\\\//g, '/')
+                    );
+                    if (isUsablePlaylistArtwork(artwork)) return artwork;
+                }
+            }
+            return '';
+        };
+        const fetchPlaylistArtwork = async item => {
+            try {
+                const response = await fetch(item.url, {
+                    credentials: 'include',
+                    headers: { 'Accept': 'text/html' }
+                });
+                if (response.ok) {
+                    const html = await response.text();
+                    const artwork = findArtworkInHtml(html);
+                    if (artwork) return artwork;
+
+                    const clientIds = [
+                        ...html.matchAll(/["']client_id["']\s*:\s*["']([A-Za-z0-9]+)["']/g),
+                        ...html.matchAll(/\bclient_id=([A-Za-z0-9]{32})/g)
+                    ].map(match => match[1]);
+                    let clientId = clientIds.find(Boolean);
+                    if (!clientId) {
+                        const scriptUrls = [
+                            ...html.matchAll(/<script[^>]+src=["']([^"']+\.js[^"']*)["']/gi)
+                        ].map(match => new URL(match[1], item.url).href)
+                            .slice(-12);
+                        for (const scriptUrl of scriptUrls) {
+                            try {
+                                const scriptResponse = await fetch(scriptUrl, {
+                                    credentials: 'omit',
+                                    headers: { 'Accept': 'application/javascript' }
+                                });
+                                if (!scriptResponse.ok) continue;
+                                const scriptSource = await scriptResponse.text();
+                                clientId = [
+                                    ...scriptSource.matchAll(/client_id["']?\s*[:=]\s*["']([A-Za-z0-9]+)["']/g)
+                                ].map(match => match[1]).find(Boolean);
+                                if (clientId) break;
+                            } catch (_) {}
+                        }
+                    }
+                    if (clientId) {
+                        const apiResponse = await fetch(
+                            `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(item.url)}&client_id=${encodeURIComponent(clientId)}`,
+                            { credentials: 'omit', headers: { 'Accept': 'application/json' } }
+                        );
+                        if (apiResponse.ok) {
+                            const playlist = await apiResponse.json();
+                            const artwork = normalizeArtworkUrl(
+                                playlist.artwork_url || playlist.avatar_url
+                            );
+                            if (isUsablePlaylistArtwork(artwork)) return artwork;
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn(`[RustCloud] Could not read artwork for ${item.title}:`, error);
+            }
+            return '';
+        };
+        const hydratePlaylistArtwork = async items => Promise.all(items.map(async item => {
+            if (isUsablePlaylistArtwork(normalizeArtworkUrl(item.artwork))) {
+                return {
+                    ...item,
+                    artwork: normalizeArtworkUrl(item.artwork)
+                };
+            }
+            const artwork = await fetchPlaylistArtwork(item);
+            return artwork ? { ...item, artwork } : item;
+        }));
         const loadLibrary = () => {
             if (libraryLoadPromise) return libraryLoadPromise;
 
@@ -1839,12 +2009,24 @@ mod desktop {
             libraryLoadPromise = Promise.all([
                 scrapePlaylistPage('/you/sets', 'created'),
                 scrapePlaylistPage('/you/likes', 'saved')
-            ]).then(([created, saved]) => {
+            ]).then(async ([created, saved]) => {
                 const createdUrls = new Set(created.map(item => item.url));
-                libraryItems = [
+                const previousByUrl = new Map(libraryItems.map(item => [item.url, item]));
+                const scrapedItems = [
                     ...created,
                     ...saved.filter(item => !createdUrls.has(item.url))
-                ];
+                ].map(item => {
+                    const previous = previousByUrl.get(item.url);
+                    if (isUsablePlaylistArtwork(normalizeArtworkUrl(item.artwork))) return item;
+                    if (previous && isUsablePlaylistArtwork(normalizeArtworkUrl(previous.artwork))) {
+                        return {
+                            ...item,
+                            artwork: normalizeArtworkUrl(previous.artwork)
+                        };
+                    }
+                    return { ...item, artwork: '' };
+                });
+                libraryItems = await hydratePlaylistArtwork(scrapedItems);
                 try {
                     localStorage.setItem(playlistCacheKey, JSON.stringify(libraryItems));
                 } catch (error) {
@@ -1886,6 +2068,17 @@ mod desktop {
         setCustomFont(settings.custom_font);
         applyTheme(settings.theme, false);
         libraryItems = readPlaylistCache();
+        if (libraryItems.length) {
+            hydratePlaylistArtwork(libraryItems).then(hydrated => {
+                libraryItems = hydrated;
+                try {
+                    localStorage.setItem(playlistCacheKey, JSON.stringify(libraryItems));
+                } catch (error) {
+                    console.warn('[RustCloud] Could not save hydrated playlist artwork:', error);
+                }
+                if (libraryPanel.classList.contains('open')) renderLibrary();
+            });
+        }
         try {
             const pinned = JSON.parse(localStorage.getItem(playlistPinsKey) || '[]');
             if (Array.isArray(pinned)) {
@@ -2219,7 +2412,7 @@ mod desktop {
         color:#f5f5f7; background:var(--bar); border-bottom:1px solid var(--edge);
         user-select:none;
     }
-    #window-titlebar-drag { flex:1; min-width:0; }
+    #window-titlebar-drag { flex:1; min-width:0; cursor:default; touch-action:none; }
     #window-titlebar-controls { position:relative; z-index:2; display:flex; }
     .window-control {
         display:grid; place-items:center; width:46px; height:33px; padding:0;
@@ -2231,11 +2424,6 @@ mod desktop {
         width:10px; height:10px; fill:none; stroke:currentColor; stroke-width:1.2;
     }
     #window-close:hover { background:#e81123; }
-    .resize-edge { position:absolute; z-index:4; touch-action:none; }
-    #resize-north { top:0; left:10px; right:10px; height:7px; cursor:n-resize; }
-    #resize-north-east { top:0; right:0; width:12px; height:12px; cursor:nesw-resize; }
-    #resize-north-west { top:0; left:0; width:12px; height:12px; cursor:nwse-resize; }
-    #window-titlebar[data-maximized="true"] .resize-edge { display:none; }
     #window-titlebar[data-theme="midnight-glass"] { --bar:#111827f5; --edge:#2b3d51; }
     #window-titlebar[data-theme="neon-pulse"] { --bar:#170f24f5; --edge:#483054; }
     #window-titlebar[data-theme="warm-vinyl"] { --bar:#211710f5; --edge:#4d3728; }
@@ -2261,9 +2449,6 @@ mod desktop {
         </button>
     </div>
 </div>
-<div class="resize-edge" id="resize-north" data-action="resizeNorth"></div>
-<div class="resize-edge" id="resize-north-east" data-action="resizeNorthEast"></div>
-<div class="resize-edge" id="resize-north-west" data-action="resizeNorthWest"></div>
 <script>
     (() => {
         const titlebar = document.getElementById('window-titlebar');
@@ -2294,18 +2479,21 @@ mod desktop {
             }[button.id]));
         });
         const drag = document.getElementById('window-titlebar-drag');
-        drag.addEventListener('pointerdown', event => {
-            if (event.button === 0) post('drag');
-        });
-        drag.addEventListener('dblclick', () => post('toggleMaximize'));
-        document.querySelectorAll('.resize-edge').forEach(edge => {
-            edge.addEventListener('pointerdown', event => {
-                if (event.button === 0) {
-                    event.preventDefault();
-                    post(edge.dataset.action);
+        let lastDragPost = 0;
+        const startDrag = event => {
+            if (event.button === 0) {
+                event.preventDefault();
+                event.stopPropagation();
+                const now = Date.now();
+                if (now - lastDragPost >= 100) {
+                    lastDragPost = now;
+                    post('drag');
                 }
-            });
-        });
+            }
+        };
+        drag.addEventListener('pointerdown', startDrag);
+        drag.addEventListener('mousedown', startDrag);
+        drag.addEventListener('dblclick', () => post('toggleMaximize'));
     })();
 </script>
 "#;
@@ -2555,7 +2743,6 @@ The requests are answered locally; they are not sent to those hosts.</p>
             {
                 eprintln!("Could not install the RustCloud F1 shortcut for the title bar: {error}");
             }
-
             self.window = Some(window);
             self.webview = Some(webview);
             self.titlebar_webview = Some(titlebar_webview);
