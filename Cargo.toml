@@ -1,6 +1,6 @@
 [package]
 name = "rustcloud"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A small SoundCloud desktop client prototype with WebView2 request blocking"
 license = "MIT"
@@ -10,6 +10,7 @@ default = ["desktop"]
 desktop = [
     "dep:serde",
     "dep:serde_json",
+    "dep:discord-rich-presence",
     "dep:image",
     "dep:ureq",
     "dep:webview2-com",
@@ -24,6 +25,7 @@ adblock = { version = "0.13.6", default-features = false, features = ["embedded-
 [target.'cfg(windows)'.dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+discord-rich-presence = { version = "1.1.0", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 ureq = { version = "3.5.2", optional = true }
 webview2-com = { version = "0.39", optional = true }

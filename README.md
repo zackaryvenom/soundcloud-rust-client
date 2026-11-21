@@ -1,6 +1,6 @@
 # RustCloud
 
-A small, Windows-first SoundCloud desktop client. RustCloud opens SoundCloud in WebView2, blocks many advertising requests, and adds a playlist sidebar, optional full-playlist shuffle, and customizable themes. The app includes an original monochrome waveform icon.
+A small, Windows-first SoundCloud desktop client. RustCloud opens SoundCloud in WebView2, blocks many advertising requests, and adds a playlist sidebar, optional full-playlist shuffle, customizable themes, and a theme-matched title bar with standard window controls. The app includes an original monochrome waveform icon.
 
 ## Requirements
 
@@ -32,9 +32,9 @@ On startup, RustCloud immediately uses cached Ghostery filter lists (or built-in
 
 Use **Library** in the top-left corner to open a searchable sidebar for your created and liked/saved playlists. It reads the lists from SoundCloud in the existing signed-in WebView session; no separate login is needed. The playlist snapshot is cached locally; use the refresh button to look for changes. Click a playlist to open it.
 
-Press **F1** to open settings. Choose **Default** to restore SoundCloud's original look, or pick **Midnight Glass**, **Neon Pulse**, **Warm Vinyl**, **Forest Glow**, **Rose Quartz**, or **Ocean Breeze** to theme the page background, text, player controls, and progress bar with a subtle matching glow and per-theme font. RustCloud's panels follow the theme too. Player controls use monochrome styling. Theme and accent choices survive in-app navigation.
+Press **F1** to open settings. Choose **Default** to restore SoundCloud's original look, or pick **Midnight Glass**, **Neon Pulse**, **Warm Vinyl**, **Forest Glow**, **Rose Quartz**, or **Ocean Breeze** to theme the page background, text, player controls, and progress bar with a subtle matching glow and a distinct font for each theme. **Custom Glass** lets you choose an accent color and font with the Midnight Glass style. RustCloud's panels follow the theme too. Player controls use monochrome styling. Theme, accent, and custom font choices survive in-app navigation.
 
-Settings also include ad blocking, optional cover-art glow that follows the current track with a smooth crossfade, and **Full-playlist shuffle** (off by default). The artwork glow observes changes instead of polling while enabled. Full-playlist shuffle loads the remaining tracks in the active queue before shuffling; this may take a little while for large playlists. Preferences are saved to `%LOCALAPPDATA%\RustCloud\settings.json`.
+Settings also include ad blocking, cover-art glow that follows the current track with a smooth crossfade, **Full-playlist shuffle** (off by default), and **Discord Rich Presence** (on by default). When Discord is running, Rich Presence shows the current track, artist, cover art, and playback progress. Toggle it under **F1 → Discord**. The artwork glow observes changes instead of polling while enabled. Full-playlist shuffle loads the remaining tracks in the active queue before shuffling; this may take a little while for large playlists. Preferences are saved to `%LOCALAPPDATA%\RustCloud\settings.json`.
 
 To prove the request hook works without waiting for SoundCloud to load an ad, run:
 
@@ -42,7 +42,7 @@ To prove the request hook works without waiting for SoundCloud to load an ad, ru
 cargo run -- --block-test
 ```
 
-This opens a small test page that requests an image from `ads.soundcloud.com` and a synthetic MP3 from the observed SoundCloud ad-delivery path. The app should log both requests as `BLOCKED` in PowerShell and increment its window title. WebView2 supplies a local empty `204 No Content` response for blocked requests instead of sending them to the host.
+This opens a small test page that requests an image from `ads.soundcloud.com` and a synthetic MP3 from the observed SoundCloud ad-delivery path. The app should log both requests as `BLOCKED` in PowerShell and increment the counter in **F1 → Ad blocking**. WebView2 supplies a local empty `204 No Content` response for blocked requests instead of sending them to the host.
 
 Run the filtering unit tests with:
 

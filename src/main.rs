@@ -8,17 +8,24 @@ mod desktop {
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc::{self, Receiver, Sender},
             Arc, Mutex, RwLock,
         },
-        time::Duration,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use adblock::Engine;
+    use discord_rich_presence::{
+        activity::{self, ActivityType, Assets, Timestamps},
+        DiscordIpc, DiscordIpcClient,
+    };
     use rustcloud::{build_filter_engine, should_block};
     use webview2_com::{
-        CoTaskMemPWSTR,
+        AcceleratorKeyPressedEventHandler, CoTaskMemPWSTR,
         Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2, ICoreWebView2_22, COREWEBVIEW2_WEB_RESOURCE_CONTEXT,
+            ICoreWebView2, ICoreWebView2_22, COREWEBVIEW2_KEY_EVENT_KIND,
+            COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+            COREWEBVIEW2_PHYSICAL_KEY_STATUS, COREWEBVIEW2_WEB_RESOURCE_CONTEXT,
             COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT,
             COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT,
             COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA,
@@ -36,14 +43,16 @@ mod desktop {
     };
     use winit::{
         application::ApplicationHandler,
-        dpi::LogicalSize,
+        dpi::{LogicalPosition, LogicalSize},
         event::WindowEvent,
         event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-        window::{Icon, Window, WindowId},
+        window::{Icon, ResizeDirection, Window, WindowId},
     };
-    use wry::{WebView, WebViewBuilder, WebViewExtWindows};
+    use wry::{Rect, WebView, WebViewBuilder, WebViewExtWindows};
 
     const SOUNDCLOUD_URL: &str = "https://soundcloud.com/";
+    const DISCORD_APPLICATION_ID: &str = "1090770350251458592";
+    const TITLEBAR_HEIGHT: u32 = 34;
     const FILTER_LIST_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
     const APP_ICON_PNG: &[u8] = include_bytes!("../assets/rustcloud.png");
     const FILTER_LIST_URLS: &[&str] = &[
@@ -74,6 +83,7 @@ mod desktop {
         theme: String,
         cover_glow_enabled: bool,
         full_playlist_shuffle_enabled: bool,
+        discord_rich_presence_enabled: bool,
     }
 
     impl Default for AppSettings {
@@ -84,6 +94,7 @@ mod desktop {
                 theme: String::from("midnight-glass"),
                 cover_glow_enabled: false,
                 full_playlist_shuffle_enabled: false,
+                discord_rich_presence_enabled: true,
             }
         }
     }
@@ -101,6 +112,265 @@ mod desktop {
         CoverGlow { enabled: bool },
         #[serde(rename = "fullPlaylistShuffle")]
         FullPlaylistShuffle { enabled: bool },
+        #[serde(rename = "discordRichPresence")]
+        DiscordRichPresence { enabled: bool },
+        #[serde(rename = "trackUpdate")]
+        TrackUpdate { track: PlaybackTrack },
+        #[serde(rename = "windowControl")]
+        WindowControl { action: WindowAction },
+    }
+
+    #[derive(Clone, Copy, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    enum WindowAction {
+        Minimize,
+        ToggleMaximize,
+        Close,
+        Drag,
+        ResizeNorth,
+        ResizeNorthEast,
+        ResizeEast,
+        ResizeSouthEast,
+        ResizeSouth,
+        ResizeSouthWest,
+        ResizeWest,
+        ResizeNorthWest,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PlaybackTrack {
+        title: String,
+        author: String,
+        artwork: String,
+        elapsed: String,
+        duration: String,
+        is_playing: bool,
+    }
+
+    enum PresenceCommand {
+        SetEnabled(bool),
+        Track(PlaybackTrack),
+    }
+
+    impl PlaybackTrack {
+        fn has_same_presence_as(&self, other: &Self) -> bool {
+            self.title == other.title
+                && self.author == other.author
+                && self.artwork == other.artwork
+                && self.duration == other.duration
+                && self.is_playing == other.is_playing
+        }
+    }
+
+    fn spawn_presence_worker(enabled: bool) -> std::io::Result<Sender<PresenceCommand>> {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(String::from("rustcloud-discord-presence"))
+            .spawn(move || run_presence_worker(receiver, enabled))?;
+        Ok(sender)
+    }
+
+    fn run_presence_worker(receiver: Receiver<PresenceCommand>, mut enabled: bool) {
+        const RETRY_INTERVAL: Duration = Duration::from_secs(30);
+        const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+        let mut client: Option<DiscordIpcClient> = None;
+        let mut latest_track: Option<PlaybackTrack> = None;
+        let mut activity_set = false;
+        let mut activity_dirty = true;
+        let mut next_connect_attempt = Instant::now();
+        let mut next_activity_refresh = Instant::now();
+
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(PresenceCommand::SetEnabled(next_enabled)) => {
+                    if enabled != next_enabled {
+                        enabled = next_enabled;
+                        if enabled {
+                            activity_dirty = true;
+                            next_connect_attempt = Instant::now();
+                            next_activity_refresh = Instant::now();
+                        } else {
+                            clear_discord_activity(&mut client, &mut activity_set);
+                            close_discord_client(&mut client);
+                        }
+                    }
+                }
+                Ok(PresenceCommand::Track(track)) => {
+                    let metadata_changed = latest_track
+                        .as_ref()
+                        .is_none_or(|current| !current.has_same_presence_as(&track));
+                    latest_track = Some(track);
+                    if metadata_changed {
+                        activity_dirty = true;
+                        next_activity_refresh = Instant::now();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            if !enabled {
+                continue;
+            }
+            let Some(track) = latest_track.as_ref() else {
+                continue;
+            };
+            if !track.is_playing || track.title.trim().is_empty() || track.author.trim().is_empty()
+            {
+                clear_discord_activity(&mut client, &mut activity_set);
+                activity_dirty = false;
+                continue;
+            }
+
+            let now = Instant::now();
+            if client.is_none() && now >= next_connect_attempt {
+                next_connect_attempt = now + RETRY_INTERVAL;
+                let mut new_client = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
+                match new_client.connect() {
+                    Ok(()) => {
+                        client = Some(new_client);
+                        activity_dirty = true;
+                        next_activity_refresh = now;
+                        println!("Connected to Discord Rich Presence.");
+                    }
+                    Err(error) => {
+                        eprintln!("Could not initialize Discord Rich Presence: {error}");
+                    }
+                }
+            }
+            if !activity_dirty && now < next_activity_refresh {
+                continue;
+            }
+
+            let result = client
+                .as_mut()
+                .map(|client| client.set_activity(discord_activity(track)));
+            match result {
+                Some(Ok(())) => {
+                    activity_set = true;
+                    activity_dirty = false;
+                    next_activity_refresh = now + ACTIVITY_REFRESH_INTERVAL;
+                }
+                Some(Err(error)) => {
+                    eprintln!("Could not update Discord Rich Presence: {error}");
+                    client.take();
+                    activity_set = false;
+                    activity_dirty = true;
+                    next_connect_attempt = now + RETRY_INTERVAL;
+                }
+                None => {}
+            }
+        }
+
+        clear_discord_activity(&mut client, &mut activity_set);
+        close_discord_client(&mut client);
+    }
+
+    fn clear_discord_activity(client: &mut Option<DiscordIpcClient>, activity_set: &mut bool) {
+        if !*activity_set {
+            return;
+        }
+        if let Some(Err(error)) = client.as_mut().map(DiscordIpc::clear_activity) {
+            eprintln!("Could not clear Discord Rich Presence: {error}");
+            client.take();
+        }
+        *activity_set = false;
+    }
+
+    fn close_discord_client(client: &mut Option<DiscordIpcClient>) {
+        if let Some(mut client) = client.take() {
+            if let Err(error) = client.close() {
+                eprintln!("Could not close the Discord Rich Presence connection: {error}");
+            }
+        }
+    }
+
+    fn discord_activity(track: &PlaybackTrack) -> activity::Activity<'static> {
+        let title = limit_discord_text(&track.title);
+        let author = limit_discord_text(&track.author);
+        let artwork = if is_https_url(&track.artwork) {
+            track.artwork.replace("50x50.", "500x500.")
+        } else {
+            String::from("soundcloud-logo")
+        };
+        let mut activity = activity::Activity::new()
+            .details(title)
+            .state(author)
+            .activity_type(ActivityType::Listening)
+            .assets(
+                Assets::new()
+                    .large_image(artwork)
+                    .large_text("SoundCloud")
+                    .small_image("soundcloud-logo")
+                    .small_text("SoundCloud"),
+            );
+        if let Some((start, end)) = presence_timestamps(track) {
+            activity = activity.timestamps(Timestamps::new().start(start).end(end));
+        }
+        activity
+    }
+
+    fn limit_discord_text(value: &str) -> String {
+        let value = value.trim();
+        if value.chars().count() > 128 {
+            format!("{}...", value.chars().take(125).collect::<String>())
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn is_https_url(value: &str) -> bool {
+        value.starts_with("https://")
+            && value.len() <= 2048
+            && !value.chars().any(char::is_whitespace)
+    }
+
+    fn parse_time_millis(value: &str) -> Option<i64> {
+        let value = value.trim();
+        let (sign, value) = match value.strip_prefix('-') {
+            Some(value) => (-1_i64, value),
+            None => (1_i64, value),
+        };
+        if value.is_empty() {
+            return None;
+        }
+        let seconds = value.split(':').try_fold(0_i64, |total, part| {
+            let part = part.parse::<i64>().ok()?;
+            if part < 0 {
+                return None;
+            }
+            total.checked_mul(60)?.checked_add(part)
+        })?;
+        seconds.checked_mul(1000)?.checked_mul(sign)
+    }
+
+    fn presence_timestamps(track: &PlaybackTrack) -> Option<(i64, i64)> {
+        presence_timestamps_at(track, unix_timestamp_millis())
+    }
+
+    fn presence_timestamps_at(track: &PlaybackTrack, now: i64) -> Option<(i64, i64)> {
+        let elapsed = parse_time_millis(&track.elapsed)?.max(0);
+        let parsed_duration = parse_time_millis(&track.duration)?;
+        let duration = if parsed_duration < 0 {
+            elapsed.saturating_add(parsed_duration.saturating_abs())
+        } else {
+            parsed_duration
+        };
+        if duration <= 0 {
+            return None;
+        }
+        let start = now.saturating_sub(elapsed);
+        Some((start, start.saturating_add(duration)))
+    }
+
+    fn unix_timestamp_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
     }
 
     const SETTINGS_UI_SCRIPT: &str = r##"
@@ -114,13 +384,19 @@ mod desktop {
         theme: 'midnight-glass',
         cover_glow_enabled: false,
         full_playlist_shuffle_enabled: false,
+        discord_rich_presence_enabled: true,
         ...(window.__RUSTCLOUD_SETTINGS__ || {})
     };
     const uiPreferencesKey = 'rustcloud.ui-preferences.v1';
+    const customFonts = [
+        'Verdana', 'Bahnschrift', 'Trebuchet MS', 'Consolas', 'Segoe UI',
+        'Calibri', 'Arial', 'Georgia', 'Cambria', 'Courier New'
+    ];
     const supportedThemes = [
         'default', 'midnight-glass', 'neon-pulse', 'warm-vinyl',
-        'forest-glow', 'rose-quartz', 'ocean-breeze'
+        'forest-glow', 'rose-quartz', 'ocean-breeze', 'custom-glass'
     ];
+    settings.custom_font = 'Verdana';
     try {
         const savedPreferences = JSON.parse(localStorage.getItem(uiPreferencesKey) || 'null');
         if (savedPreferences && typeof savedPreferences === 'object') {
@@ -128,6 +404,9 @@ mod desktop {
             if (typeof savedPreferences.accent_color === 'string' &&
                 /^#[0-9a-f]{6}$/i.test(savedPreferences.accent_color)) {
                 settings.accent_color = savedPreferences.accent_color;
+            }
+            if (customFonts.includes(savedPreferences.custom_font)) {
+                settings.custom_font = savedPreferences.custom_font;
             }
         }
     } catch (error) {
@@ -137,7 +416,8 @@ mod desktop {
         try {
             localStorage.setItem(uiPreferencesKey, JSON.stringify({
                 theme: settings.theme,
-                accent_color: settings.accent_color
+                accent_color: settings.accent_color,
+                custom_font: settings.custom_font
             }));
         } catch (error) {
             console.warn('[RustCloud] Could not save theme preferences:', error);
@@ -328,7 +608,19 @@ mod desktop {
                 :host([data-theme="warm-vinyl"]) {
                     --theme-surface:#211711; --theme-card:#f2bd740d; --theme-border:#f4c18c24;
                 }
+                :host([data-theme="custom-glass"]) {
+                    --theme-surface:#152131;
+                    --theme-card:color-mix(in srgb,var(--accent) 5%,transparent);
+                    --theme-border:color-mix(in srgb,var(--accent) 15%,transparent);
+                }
                 button, input { font: inherit; }
+                *::-webkit-scrollbar { width:10px; height:10px; }
+                *::-webkit-scrollbar-track { background:var(--theme-surface); }
+                *::-webkit-scrollbar-thumb {
+                    border:2px solid var(--theme-surface); border-radius:999px;
+                    background:var(--theme-border);
+                }
+                *::-webkit-scrollbar-thumb:hover { background:var(--accent); }
                 #cover-art-glow-a, #cover-art-glow-b {
                     position: fixed; inset: -14%; z-index: 0; opacity: 0;
                     background-position: center; background-size: cover;
@@ -341,6 +633,57 @@ mod desktop {
                 kbd {
                     padding: 2px 6px; border-radius: 5px; background: #ffffff16;
                     color: #c9c9ce; font-size: 11px;
+                }
+                #window-titlebar {
+                    position:fixed; inset:0 0 auto; z-index:5; height:34px;
+                    display:flex; align-items:stretch; color:#f5f5f7;
+                    background:#17171bf5; border-bottom:1px solid #ffffff18;
+                    user-select:none; pointer-events:auto;
+                }
+                #window-titlebar,
+                #resize-north, #resize-north-east, #resize-north-west { display:none; }
+                #window-titlebar-drag {
+                    display:flex; flex:1; align-items:center; gap:9px;
+                    min-width:0; cursor:default;
+                }
+                #window-titlebar-controls { position:relative; z-index:7; display:flex; }
+                .window-control {
+                    display:grid; place-items:center; width:46px; height:33px;
+                    padding:0; border:0; color:inherit; background:transparent; cursor:pointer;
+                }
+                .window-control:hover { background:#ffffff1a; }
+                .window-control:focus-visible { outline:1px solid var(--accent); outline-offset:-2px; }
+                .window-control svg { width:10px; height:10px; fill:none; stroke:currentColor; stroke-width:1.2; }
+                #window-close:hover { background:#e81123; }
+                .resize-edge {
+                    position:fixed; z-index:6; pointer-events:auto; touch-action:none;
+                }
+                #resize-north, #resize-south { left:10px; right:10px; height:7px; }
+                #resize-north { top:0; cursor:n-resize; }
+                #resize-south { bottom:0; cursor:s-resize; }
+                #resize-east, #resize-west { top:0; bottom:10px; width:7px; }
+                #resize-east { right:0; cursor:e-resize; }
+                #resize-west { left:0; cursor:w-resize; }
+                #resize-north-east, #resize-south-west {
+                    width:12px; height:12px; cursor:nesw-resize;
+                }
+                #resize-north-west, #resize-south-east {
+                    width:12px; height:12px; cursor:nwse-resize;
+                }
+                #resize-north-east { top:0; right:0; }
+                #resize-north-west { top:0; left:0; }
+                #resize-south-east { right:0; bottom:0; }
+                #resize-south-west { left:0; bottom:0; }
+                :host([data-maximized="true"]) .resize-edge { display:none; }
+                :host([data-theme="midnight-glass"]) #window-titlebar { background:#111827f5; border-color:#2b3d51; }
+                :host([data-theme="neon-pulse"]) #window-titlebar { background:#170f24f5; border-color:#483054; }
+                :host([data-theme="warm-vinyl"]) #window-titlebar { background:#211710f5; border-color:#4d3728; }
+                :host([data-theme="forest-glow"]) #window-titlebar { background:#111e1af5; border-color:#2b4638; }
+                :host([data-theme="rose-quartz"]) #window-titlebar { background:#1d111bf5; border-color:#493044; }
+                :host([data-theme="ocean-breeze"]) #window-titlebar { background:#0e1a24f5; border-color:#294858; }
+                :host([data-theme="custom-glass"]) #window-titlebar {
+                    background:color-mix(in srgb,var(--accent) 8%,#111827f5);
+                    border-color:color-mix(in srgb,var(--accent) 24%,transparent);
                 }
                 #scrim {
                     position: fixed; inset: 0; z-index: 1; background: #0008;
@@ -424,6 +767,8 @@ mod desktop {
                 .theme-choice[data-theme="rose-quartz"] .theme-preview span { background:#ff82b7; box-shadow:0 0 8px #ff82b7; }
                 .theme-choice[data-theme="ocean-breeze"] .theme-preview { background:linear-gradient(135deg,#0c1720,#153247); }
                 .theme-choice[data-theme="ocean-breeze"] .theme-preview span { background:#67dce5; box-shadow:0 0 8px #67dce5; }
+                .theme-choice[data-theme="custom-glass"] .theme-preview { background:linear-gradient(135deg,#101827,#23314a); }
+                .theme-choice[data-theme="custom-glass"] .theme-preview span { background:#78caff; box-shadow:0 0 8px #78caff; }
                 .theme-choice[data-theme="default"] .theme-preview { background:linear-gradient(135deg,#262626,#414141); }
                 .theme-choice[data-theme="default"] .theme-preview span { background:#ff5500; }
                 .theme-choice-name { display:block; font-size:10px; font-weight:650; line-height:1.2; }
@@ -439,6 +784,13 @@ mod desktop {
                 }
                 #custom-color::-webkit-color-swatch-wrapper { padding:0; }
                 #custom-color::-webkit-color-swatch { border:2px solid #ffffff65; border-radius:50%; }
+                #custom-theme-controls { margin-top:14px; }
+                #custom-font {
+                    width:100%; margin-top:8px; padding:9px 10px;
+                    border:1px solid var(--theme-border); border-radius:9px;
+                    color:#f5f5f7; background:#17171b; font-size:12px;
+                }
+                #custom-font:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
                 .footer { margin-top:28px; color:#777780; font-size:11px; }
                 #shuffle-status {
                     position:fixed; right:22px; bottom:22px; z-index:4;
@@ -468,7 +820,7 @@ mod desktop {
                     position:fixed; inset:0 auto 0 0; z-index:2;
                     display:flex; flex-direction:column; gap:18px;
                     width:min(320px,calc(100vw - 24px)); padding:24px 16px;
-                    color:#f5f5f7; background:#17171bf7;
+                    color:#f5f5f7; background:var(--theme-surface);
                     border-right:1px solid #ffffff14; box-shadow:20px 0 60px #0006;
                     transform:translateX(-105%); transition:transform 220ms ease;
                     pointer-events:auto;
@@ -516,6 +868,28 @@ mod desktop {
                 }
                 .library-empty { padding:18px 8px; color:#96969f; font-size:12px; line-height:1.55; }
             </style>
+            <div id="window-titlebar">
+                <div id="window-titlebar-drag" aria-label="Drag window"></div>
+                <div id="window-titlebar-controls">
+                    <button class="window-control" id="window-minimize" aria-label="Minimize">
+                        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8"/></svg>
+                    </button>
+                    <button class="window-control" id="window-maximize" aria-label="Maximize">
+                        <svg viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7"/></svg>
+                    </button>
+                    <button class="window-control" id="window-close" aria-label="Close">
+                        <svg viewBox="0 0 10 10" aria-hidden="true"><path d="m1.5 1.5 7 7m0-7-7 7"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div class="resize-edge" id="resize-north" data-action="resizeNorth" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-north-east" data-action="resizeNorthEast" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-east" data-action="resizeEast" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-south-east" data-action="resizeSouthEast" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-south" data-action="resizeSouth" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-south-west" data-action="resizeSouthWest" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-west" data-action="resizeWest" aria-hidden="true"></div>
+            <div class="resize-edge" id="resize-north-west" data-action="resizeNorthWest" aria-hidden="true"></div>
             <button id="library-launcher" aria-expanded="false" aria-controls="library-panel">
                 <span id="library-mark" aria-hidden="true">♫</span><span>Library</span>
             </button>
@@ -543,6 +917,9 @@ mod desktop {
                     <div>
                         <div class="title">Ad blocking</div>
                         <div class="description">Blocks new requests matched by your filter lists.</div>
+                        <div id="blocked-count" class="description" role="status" aria-live="polite">
+                            0 ad requests blocked this session
+                        </div>
                     </div>
                     <label class="switch" aria-label="Enable ad blocking">
                         <input id="adblock" type="checkbox">
@@ -588,6 +965,11 @@ mod desktop {
                             <span class="theme-choice-name">Ocean Breeze</span>
                             <span class="theme-choice-note">Fresh &amp; cool</span>
                         </button>
+                        <button class="theme-choice" data-theme="custom-glass" aria-pressed="false">
+                            <span class="theme-preview"><span></span><i></i></span>
+                            <span class="theme-choice-name">Custom Glass</span>
+                            <span class="theme-choice-note">Your color &amp; font</span>
+                        </button>
                     </div>
                     <div class="title" style="margin-bottom:14px">Accent color</div>
                     <div class="palette" role="group" aria-label="Accent color">
@@ -597,6 +979,22 @@ mod desktop {
                         <button class="swatch" data-color="#34d399" aria-label="Mint green"></button>
                         <button class="swatch" data-color="#fb7185" aria-label="Rose"></button>
                         <input id="custom-color" type="color" aria-label="Choose a custom accent color">
+                    </div>
+                    <div id="custom-theme-controls" hidden>
+                        <label class="title" for="custom-font">Custom Glass font</label>
+                        <select id="custom-font" aria-label="Choose a font for Custom Glass">
+                            <option>Verdana</option>
+                            <option>Bahnschrift</option>
+                            <option>Trebuchet MS</option>
+                            <option>Consolas</option>
+                            <option>Segoe UI</option>
+                            <option>Calibri</option>
+                            <option>Arial</option>
+                            <option>Georgia</option>
+                            <option>Cambria</option>
+                            <option>Courier New</option>
+                        </select>
+                        <div class="description">Choose the accent color above, then select a font for your custom Midnight Glass-style theme.</div>
                     </div>
                 </div>
                 <p class="section-label">Ambience</p>
@@ -621,6 +1019,17 @@ mod desktop {
                         <span class="track"></span>
                     </label>
                 </div>
+                <p class="section-label">Discord</p>
+                <div class="card row">
+                    <div>
+                        <div class="title">Rich Presence</div>
+                        <div class="description">Show the current track, artist, cover art, and playback progress in Discord. Discord must be running.</div>
+                    </div>
+                    <label class="switch" aria-label="Enable Discord Rich Presence">
+                        <input id="discord-rich-presence" type="checkbox">
+                        <span class="track"></span>
+                    </label>
+                </div>
                 <p class="footer">Press F1 to toggle settings · Esc to close</p>
             </aside>
             <div id="cover-art-glow-a" aria-hidden="true"></div>
@@ -629,6 +1038,12 @@ mod desktop {
         `;
 
         document.documentElement.appendChild(host);
+        window.__RUSTCLOUD_RENDER_BLOCKED_COUNT__ = () => {
+            const display = root.getElementById('blocked-count');
+            const count = Number(window.__RUSTCLOUD_BLOCKED_COUNT__) || 0;
+            display.textContent = `${count} ad request${count === 1 ? '' : 's'} blocked this session`;
+        };
+        window.__RUSTCLOUD_RENDER_BLOCKED_COUNT__();
         const libraryLauncher = root.getElementById('library-launcher');
         const libraryPanel = root.getElementById('library-panel');
         const libraryClose = root.getElementById('library-close');
@@ -638,17 +1053,26 @@ mod desktop {
         const playlistItemsElement = root.getElementById('playlist-items');
         const panel = root.getElementById('panel');
         const scrim = root.getElementById('scrim');
+        const titlebarDrag = root.getElementById('window-titlebar-drag');
+        const minimizeButton = root.getElementById('window-minimize');
+        const maximizeButton = root.getElementById('window-maximize');
+        const closeButton = root.getElementById('window-close');
+        const resizeEdges = [...root.querySelectorAll('.resize-edge')];
         const adblock = root.getElementById('adblock');
         const coverGlow = root.getElementById('cover-glow');
         const fullPlaylistShuffle = root.getElementById('full-playlist-shuffle');
+        const discordRichPresence = root.getElementById('discord-rich-presence');
         const shuffleStatus = root.getElementById('shuffle-status');
         const artGlowLayers = [
             root.getElementById('cover-art-glow-a'),
             root.getElementById('cover-art-glow-b')
         ];
         const colorPicker = root.getElementById('custom-color');
+        const customThemeControls = root.getElementById('custom-theme-controls');
+        const customFontPicker = root.getElementById('custom-font');
         const swatches = [...root.querySelectorAll('.swatch')];
         const themeButtons = [...root.querySelectorAll('.theme-choice')];
+        const customThemeButton = root.querySelector('.theme-choice[data-theme="custom-glass"]');
         const themeStyle = document.createElement('style');
         themeStyle.id = 'rustcloud-theme-styles';
         themeStyle.textContent = `
@@ -659,7 +1083,7 @@ mod desktop {
                 --rustcloud-player:#111827e8; --rustcloud-page:#0c121d;
                 --rustcloud-surface:#152131; --rustcloud-text:#e5eef8;
                 --rustcloud-muted:#9aafc4; --rustcloud-edge:#2b3d51;
-                --rustcloud-font:"Segoe UI Variable","Segoe UI",sans-serif;
+                --rustcloud-font:"Verdana","Segoe UI",sans-serif;
             }
             :root[data-rustcloud-theme="neon-pulse"] {
                 --rustcloud-accent:#f16bff; --rustcloud-accent-deep:#833bdb;
@@ -677,7 +1101,7 @@ mod desktop {
                 --rustcloud-player:#211710ed; --rustcloud-page:#1b1410;
                 --rustcloud-surface:#291d16; --rustcloud-text:#f5e8d8;
                 --rustcloud-muted:#c3a98c; --rustcloud-edge:#4d3728;
-                --rustcloud-font:"Trebuchet MS","Segoe UI",sans-serif;
+                --rustcloud-font:"Georgia","Times New Roman",serif;
             }
             :root[data-rustcloud-theme="forest-glow"] {
                 --rustcloud-accent:#69d6a8; --rustcloud-accent-deep:#28785f;
@@ -686,7 +1110,7 @@ mod desktop {
                 --rustcloud-player:#111e1aeb; --rustcloud-page:#0c1511;
                 --rustcloud-surface:#14231b; --rustcloud-text:#e4f3e9;
                 --rustcloud-muted:#a0b9a9; --rustcloud-edge:#2d4939;
-                --rustcloud-font:"Segoe UI Variable","Segoe UI",sans-serif;
+                --rustcloud-font:"Calibri","Segoe UI",sans-serif;
             }
             :root[data-rustcloud-theme="rose-quartz"] {
                 --rustcloud-accent:#ff82b7; --rustcloud-accent-deep:#a84b7b;
@@ -695,7 +1119,7 @@ mod desktop {
                 --rustcloud-player:#1d111bed; --rustcloud-page:#150d15;
                 --rustcloud-surface:#241625; --rustcloud-text:#f8eaf3;
                 --rustcloud-muted:#c6a9bc; --rustcloud-edge:#50334a;
-                --rustcloud-font:"Georgia","Times New Roman",serif;
+                --rustcloud-font:"Trebuchet MS","Segoe UI",sans-serif;
             }
             :root[data-rustcloud-theme="ocean-breeze"] {
                 --rustcloud-accent:#67dce5; --rustcloud-accent-deep:#347eb3;
@@ -704,11 +1128,43 @@ mod desktop {
                 --rustcloud-player:#0e1a24ed; --rustcloud-page:#0a121a;
                 --rustcloud-surface:#122332; --rustcloud-text:#e5f3f8;
                 --rustcloud-muted:#9eb8c5; --rustcloud-edge:#2b4659;
-                --rustcloud-font:"Calibri","Segoe UI",sans-serif;
+                --rustcloud-font:"Cambria","Georgia",serif;
+            }
+            :root[data-rustcloud-theme="custom-glass"] {
+                --rustcloud-accent:var(--rustcloud-custom-accent,#78caff);
+                --rustcloud-accent-deep:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 60%,#152131);
+                --rustcloud-glow:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 40%,transparent);
+                --rustcloud-glow-soft:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 22%,transparent);
+                --rustcloud-glow-faint:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 11%,transparent);
+                --rustcloud-player:#111827e8; --rustcloud-page:#0c121d;
+                --rustcloud-surface:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 9%,#152131);
+                --rustcloud-text:#e5eef8; --rustcloud-muted:#9aafc4;
+                --rustcloud-edge:color-mix(in srgb,var(--rustcloud-custom-accent,#78caff) 23%,#2b3d51);
+                --rustcloud-font:var(--rustcloud-custom-font,"Verdana"),"Segoe UI",sans-serif;
             }
             html[data-rustcloud-theme], body {
                 background-color:var(--rustcloud-page)!important;
                 color:var(--rustcloud-text)!important;
+            }
+            html[data-rustcloud-theme] {
+                scrollbar-color:var(--rustcloud-edge) var(--rustcloud-page);
+            }
+            html[data-rustcloud-theme]::-webkit-scrollbar,
+            html[data-rustcloud-theme] *::-webkit-scrollbar {
+                width:12px; height:12px;
+            }
+            html[data-rustcloud-theme]::-webkit-scrollbar-track,
+            html[data-rustcloud-theme] *::-webkit-scrollbar-track {
+                background:var(--rustcloud-page);
+            }
+            html[data-rustcloud-theme]::-webkit-scrollbar-thumb,
+            html[data-rustcloud-theme] *::-webkit-scrollbar-thumb {
+                border:3px solid var(--rustcloud-page); border-radius:999px;
+                background:var(--rustcloud-edge);
+            }
+            html[data-rustcloud-theme]::-webkit-scrollbar-thumb:hover,
+            html[data-rustcloud-theme] *::-webkit-scrollbar-thumb:hover {
+                background:var(--rustcloud-accent);
             }
             body {
                 background-image:
@@ -720,6 +1176,11 @@ mod desktop {
             body button, body input, body textarea,
             body .sc-type, body .sc-font,
             body [class*="soundTitle"], body [class*="playlistHeader"] {
+                font-family:var(--rustcloud-font)!important;
+            }
+            :root[data-rustcloud-theme] body
+            :not(svg):not(svg *):not([class*="icon"]):not([class*="Icon"])
+            :not([class*="symbol"]):not([class*="Symbol"]) {
                 font-family:var(--rustcloud-font)!important;
             }
             body .header, body .header__inner, body .l-header,
@@ -904,6 +1365,135 @@ mod desktop {
                 window.ipc.postMessage(JSON.stringify(message));
             }
         };
+        const maximizeIcon = '<svg viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7"/></svg>';
+        const restoreIcon = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5h5.5V7M7 3H1.5v5.5H7V3"/></svg>';
+        window.__RUSTCLOUD_SET_MAXIMIZED__ = maximized => {
+            host.dataset.maximized = String(maximized);
+            maximizeButton.innerHTML = maximized ? restoreIcon : maximizeIcon;
+            maximizeButton.setAttribute('aria-label', maximized ? 'Restore' : 'Maximize');
+        };
+        const toggleSettings = () => {
+            setLibraryOpen(false);
+            setOpen(!panel.classList.contains('open'));
+        };
+        window.__RUSTCLOUD_TOGGLE_SETTINGS__ = toggleSettings;
+        resizeEdges.forEach(edge => {
+            edge.addEventListener('pointerdown', event => {
+                if (event.button === 0) {
+                    event.preventDefault();
+                    post({ type: 'windowControl', action: edge.dataset.action });
+                }
+            });
+        });
+        titlebarDrag.addEventListener('pointerdown', event => {
+            if (event.button === 0) post({ type: 'windowControl', action: 'drag' });
+        });
+        titlebarDrag.addEventListener('dblclick', () => {
+            post({ type: 'windowControl', action: 'toggleMaximize' });
+        });
+        minimizeButton.addEventListener('click', () => {
+            post({ type: 'windowControl', action: 'minimize' });
+        });
+        maximizeButton.addEventListener('click', () => {
+            post({ type: 'windowControl', action: 'toggleMaximize' });
+        });
+        closeButton.addEventListener('click', () => {
+            post({ type: 'windowControl', action: 'close' });
+        });
+        let lastPresenceIdentity = '';
+        let lastPresenceUpdateAt = 0;
+        let presenceUpdateTimer = 0;
+        let presenceInterval = null;
+        let presenceObservedRoots = [];
+        const presenceObserver = new MutationObserver(() => schedulePresenceUpdate());
+        const presenceRootObserver = new MutationObserver(observePresenceRoots);
+        const readPlaybackTrack = () => {
+            const artworkNode = document.querySelector(
+                '.playbackSoundBadge__avatar .image__lightOutline span'
+            );
+            const artworkImage = document.querySelector('.playbackSoundBadge__avatar img');
+            const artworkStyle = artworkNode
+                ? (artworkNode.style.backgroundImage || getComputedStyle(artworkNode).backgroundImage)
+                : '';
+            const artworkMatch = artworkStyle.match(/url\((["']?)(.*?)\1\)/);
+            const artwork = artworkMatch ? artworkMatch[2] : artworkImage?.src || '';
+            const title = artworkNode?.getAttribute('aria-label') ||
+                document.querySelector('.playbackSoundBadge__title')?.textContent?.trim() || '';
+            const author = document.querySelector('.playbackSoundBadge__lightLink')
+                ?.textContent?.trim() || '';
+            const playControl = document.querySelector('.playControls__play');
+            return {
+                title,
+                author,
+                artwork: artwork.replace('50x50.', '500x500.'),
+                elapsed: document.querySelector(
+                    '.playbackTimeline__timePassed span:last-child'
+                )?.textContent?.trim() || '',
+                duration: document.querySelector(
+                    '.playbackTimeline__duration span:last-child'
+                )?.textContent?.trim() || '',
+                isPlaying: !!playControl?.classList.contains('playing')
+            };
+        };
+        const sendPresenceUpdate = (force = false) => {
+            if (!settings.discord_rich_presence_enabled) return;
+            const track = readPlaybackTrack();
+            const identity = JSON.stringify({
+                title: track.title,
+                author: track.author,
+                artwork: track.artwork,
+                duration: track.duration,
+                isPlaying: track.isPlaying
+            });
+            const now = Date.now();
+            if (!force && identity === lastPresenceIdentity &&
+                (!track.isPlaying || now - lastPresenceUpdateAt < 15000)) return;
+            lastPresenceIdentity = identity;
+            lastPresenceUpdateAt = now;
+            post({ type: 'trackUpdate', track });
+        };
+        const schedulePresenceUpdate = () => {
+            clearTimeout(presenceUpdateTimer);
+            presenceUpdateTimer = window.setTimeout(() => sendPresenceUpdate(), 250);
+        };
+        function observePresenceRoots() {
+            if (!settings.discord_rich_presence_enabled) return;
+            const roots = [...document.querySelectorAll('.playControls, .playbackSoundBadge')];
+            if (roots.length === presenceObservedRoots.length &&
+                roots.every((root, index) => root === presenceObservedRoots[index])) return;
+            presenceObservedRoots = roots;
+            presenceObserver.disconnect();
+            for (const root of roots) {
+                presenceObserver.observe(root, {
+                    attributes: true,
+                    childList: true,
+                    characterData: true,
+                    subtree: true
+                });
+            }
+            sendPresenceUpdate(true);
+        }
+        const startPresenceObserver = () => {
+            if (!settings.discord_rich_presence_enabled || presenceInterval !== null) return;
+            const root = document.body || document.documentElement;
+            if (!root) {
+                document.addEventListener('DOMContentLoaded', startPresenceObserver, { once: true });
+                return;
+            }
+            presenceRootObserver.observe(root, { childList: true, subtree: true });
+            observePresenceRoots();
+            presenceInterval = window.setInterval(() => sendPresenceUpdate(), 15000);
+        };
+        const stopPresenceObserver = () => {
+            presenceRootObserver.disconnect();
+            presenceObserver.disconnect();
+            clearTimeout(presenceUpdateTimer);
+            if (presenceInterval !== null) {
+                clearInterval(presenceInterval);
+                presenceInterval = null;
+            }
+            presenceObservedRoots = [];
+        };
         const setOpen = open => {
             panel.classList.toggle('open', open);
             scrim.classList.toggle('open', open);
@@ -917,11 +1507,21 @@ mod desktop {
         const setAccent = color => {
             if (!/^#[0-9a-f]{6}$/i.test(color)) return;
             host.style.setProperty('--accent', color);
+            document.documentElement.style.setProperty('--rustcloud-custom-accent', color);
             colorPicker.value = color;
+            customThemeButton.querySelector('.theme-preview span').style.background = color;
+            customThemeButton.querySelector('.theme-preview span').style.boxShadow = `0 0 8px ${color}`;
             swatches.forEach(button => button.classList.toggle('active', button.dataset.color === color));
             settings.accent_color = color;
             saveUiPreferences();
             post({ type: 'accent', color });
+        };
+        const setCustomFont = font => {
+            if (!customFonts.includes(font)) return;
+            settings.custom_font = font;
+            customFontPicker.value = font;
+            document.documentElement.style.setProperty('--rustcloud-custom-font', JSON.stringify(font));
+            saveUiPreferences();
         };
         const themes = {
             default: { accent: null },
@@ -930,7 +1530,8 @@ mod desktop {
             'warm-vinyl': { accent: '#f3ad59' },
             'forest-glow': { accent: '#69d6a8' },
             'rose-quartz': { accent: '#ff82b7' },
-            'ocean-breeze': { accent: '#67dce5' }
+            'ocean-breeze': { accent: '#67dce5' },
+            'custom-glass': { accent: null }
         };
         const applyTheme = (name, updateAccent) => {
             if (!Object.prototype.hasOwnProperty.call(themes, name)) name = 'midnight-glass';
@@ -947,6 +1548,7 @@ mod desktop {
             themeButtons.forEach(button => {
                 button.setAttribute('aria-pressed', String(button.dataset.theme === name));
             });
+            customThemeControls.hidden = name !== 'custom-glass';
             if (updateAccent && themes[name].accent) setAccent(themes[name].accent);
             saveUiPreferences();
             post({ type: 'theme', name });
@@ -1188,11 +1790,13 @@ mod desktop {
         adblock.checked = settings.ad_block_enabled !== false;
         coverGlow.checked = settings.cover_glow_enabled === true;
         fullPlaylistShuffle.checked = settings.full_playlist_shuffle_enabled === true;
+        discordRichPresence.checked = settings.discord_rich_presence_enabled !== false;
         colorPicker.value = settings.accent_color;
+        customFontPicker.value = settings.custom_font;
         themeButtons.forEach(button => {
             button.addEventListener('click', () => {
                 applyTheme(button.dataset.theme, true);
-                syncPlayingTrackTheme();
+                observePlayingTrack();
             });
         });
         swatches.forEach(button => {
@@ -1200,6 +1804,7 @@ mod desktop {
             button.addEventListener('click', () => setAccent(button.dataset.color));
         });
         setAccent(settings.accent_color);
+        setCustomFont(settings.custom_font);
         applyTheme(settings.theme, false);
         libraryItems = readPlaylistCache();
         if (libraryItems.length) renderLibrary();
@@ -1374,6 +1979,7 @@ mod desktop {
                     ?.setAttribute('data-rustcloud-playing', 'true');
             }
         };
+        let playingTrackObserver = null;
         let playingTrackUpdateScheduled = false;
         const schedulePlayingTrackThemeSync = () => {
             if (playingTrackUpdateScheduled) return;
@@ -1384,13 +1990,24 @@ mod desktop {
             });
         };
         const observePlayingTrack = () => {
+            if (settings.theme === 'default') {
+                if (playingTrackObserver) {
+                    playingTrackObserver.disconnect();
+                    playingTrackObserver = null;
+                }
+                syncPlayingTrackTheme();
+                return;
+            }
             const root = document.body || document.documentElement;
             if (!root) {
                 document.addEventListener('DOMContentLoaded', observePlayingTrack, { once: true });
                 return;
             }
-            const observer = new MutationObserver(schedulePlayingTrackThemeSync);
-            observer.observe(root, {
+            if (!playingTrackObserver) {
+                playingTrackObserver = new MutationObserver(schedulePlayingTrackThemeSync);
+            }
+            playingTrackObserver.disconnect();
+            playingTrackObserver.observe(root, {
                 attributes: true,
                 attributeFilter: ['class', 'href'],
                 childList: true,
@@ -1458,13 +2075,23 @@ mod desktop {
             post({ type: 'fullPlaylistShuffle', enabled: fullPlaylistShuffle.checked });
             if (fullPlaylistShuffle.checked) installShuffleEnhancement();
         });
+        discordRichPresence.addEventListener('change', () => {
+            settings.discord_rich_presence_enabled = discordRichPresence.checked;
+            post({ type: 'discordRichPresence', enabled: discordRichPresence.checked });
+            if (discordRichPresence.checked) {
+                lastPresenceIdentity = '';
+                startPresenceObserver();
+            } else {
+                stopPresenceObserver();
+            }
+        });
         colorPicker.addEventListener('change', () => setAccent(colorPicker.value));
+        customFontPicker.addEventListener('change', () => setCustomFont(customFontPicker.value));
         window.addEventListener('keydown', event => {
             if (event.key === 'F1') {
                 event.preventDefault();
                 event.stopPropagation();
-                setLibraryOpen(false);
-                setOpen(!panel.classList.contains('open'));
+                toggleSettings();
             } else if (event.key === 'Escape' && (
                 panel.classList.contains('open') || libraryPanel.classList.contains('open')
             )) {
@@ -1476,6 +2103,7 @@ mod desktop {
         observeArtworkRoot();
         updateArtworkGlow();
         observePlayingTrack();
+        startPresenceObserver();
         installShuffleEnhancement();
     };
 
@@ -1487,6 +2115,111 @@ mod desktop {
 })();
 "##;
 
+    const TITLEBAR_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<style>
+    :root {
+        color-scheme: dark; --accent:#78caff; --bar:#17171bf5; --edge:#ffffff18;
+        font-family:"Segoe UI",system-ui,sans-serif;
+    }
+    * { box-sizing:border-box; }
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; }
+    #window-titlebar {
+        position:relative; display:flex; align-items:stretch; width:100%; height:34px;
+        color:#f5f5f7; background:var(--bar); border-bottom:1px solid var(--edge);
+        user-select:none;
+    }
+    #window-titlebar-drag { flex:1; min-width:0; }
+    #window-titlebar-controls { position:relative; z-index:2; display:flex; }
+    .window-control {
+        display:grid; place-items:center; width:46px; height:33px; padding:0;
+        border:0; color:inherit; background:transparent; cursor:pointer;
+    }
+    .window-control:hover { background:#ffffff1a; }
+    .window-control:focus-visible { outline:1px solid var(--accent); outline-offset:-2px; }
+    .window-control svg {
+        width:10px; height:10px; fill:none; stroke:currentColor; stroke-width:1.2;
+    }
+    #window-close:hover { background:#e81123; }
+    .resize-edge { position:absolute; z-index:4; touch-action:none; }
+    #resize-north { top:0; left:10px; right:10px; height:7px; cursor:n-resize; }
+    #resize-north-east { top:0; right:0; width:12px; height:12px; cursor:nesw-resize; }
+    #resize-north-west { top:0; left:0; width:12px; height:12px; cursor:nwse-resize; }
+    #window-titlebar[data-maximized="true"] .resize-edge { display:none; }
+    #window-titlebar[data-theme="midnight-glass"] { --bar:#111827f5; --edge:#2b3d51; }
+    #window-titlebar[data-theme="neon-pulse"] { --bar:#170f24f5; --edge:#483054; }
+    #window-titlebar[data-theme="warm-vinyl"] { --bar:#211710f5; --edge:#4d3728; }
+    #window-titlebar[data-theme="forest-glow"] { --bar:#111e1af5; --edge:#2b4638; }
+    #window-titlebar[data-theme="rose-quartz"] { --bar:#1d111bf5; --edge:#493044; }
+    #window-titlebar[data-theme="ocean-breeze"] { --bar:#0e1a24f5; --edge:#294858; }
+    #window-titlebar[data-theme="custom-glass"] {
+        --bar:color-mix(in srgb,var(--accent) 8%,#111827f5);
+        --edge:color-mix(in srgb,var(--accent) 24%,transparent);
+    }
+</style>
+<div id="window-titlebar" data-theme="default">
+    <div id="window-titlebar-drag" aria-label="Drag window"></div>
+    <div id="window-titlebar-controls">
+        <button class="window-control" id="window-minimize" aria-label="Minimize">
+            <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 5h8"/></svg>
+        </button>
+        <button class="window-control" id="window-maximize" aria-label="Maximize">
+            <svg viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7"/></svg>
+        </button>
+        <button class="window-control" id="window-close" aria-label="Close">
+            <svg viewBox="0 0 10 10" aria-hidden="true"><path d="m1.5 1.5 7 7m0-7-7 7"/></svg>
+        </button>
+    </div>
+</div>
+<div class="resize-edge" id="resize-north" data-action="resizeNorth"></div>
+<div class="resize-edge" id="resize-north-east" data-action="resizeNorthEast"></div>
+<div class="resize-edge" id="resize-north-west" data-action="resizeNorthWest"></div>
+<script>
+    (() => {
+        const titlebar = document.getElementById('window-titlebar');
+        const maximizeButton = document.getElementById('window-maximize');
+        const maximizeIcon = '<svg viewBox="0 0 10 10" aria-hidden="true"><rect x="1.5" y="1.5" width="7" height="7"/></svg>';
+        const restoreIcon = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 1.5h5.5V7M7 3H1.5v5.5H7V3"/></svg>';
+        const post = action => {
+            if (window.ipc && typeof window.ipc.postMessage === 'function') {
+                window.ipc.postMessage(JSON.stringify({ type:'windowControl', action }));
+            }
+        };
+        window.__RUSTCLOUD_SET_MAXIMIZED__ = maximized => {
+            titlebar.dataset.maximized = String(maximized);
+            maximizeButton.innerHTML = maximized ? restoreIcon : maximizeIcon;
+            maximizeButton.setAttribute('aria-label', maximized ? 'Restore' : 'Maximize');
+        };
+        window.__RUSTCLOUD_SET_APPEARANCE__ = (theme, accent) => {
+            titlebar.dataset.theme = theme;
+            titlebar.style.setProperty('--accent', accent);
+        };
+        const appearance = window.__RUSTCLOUD_TITLEBAR_APPEARANCE__;
+        if (appearance) window.__RUSTCLOUD_SET_APPEARANCE__(appearance[0], appearance[1]);
+        document.querySelectorAll('.window-control').forEach(button => {
+            button.addEventListener('click', () => post({
+                'window-minimize':'minimize',
+                'window-maximize':'toggleMaximize',
+                'window-close':'close'
+            }[button.id]));
+        });
+        const drag = document.getElementById('window-titlebar-drag');
+        drag.addEventListener('pointerdown', event => {
+            if (event.button === 0) post('drag');
+        });
+        drag.addEventListener('dblclick', () => post('toggleMaximize'));
+        document.querySelectorAll('.resize-edge').forEach(edge => {
+            edge.addEventListener('pointerdown', event => {
+                if (event.button === 0) {
+                    event.preventDefault();
+                    post(edge.dataset.action);
+                }
+            });
+        });
+    })();
+</script>
+"#;
+
     const DEMO_HTML: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <title>RustCloud blocker check</title>
@@ -1494,24 +2227,104 @@ mod desktop {
 <h1>Request-blocking check</h1>
 <p>This page requests an image from <code>ads.soundcloud.com</code> and an audio file
 from the observed SoundCloud ad-delivery path.</p>
-<p>RustCloud should intercept both and show a blocked-request count in the window title.
+<p>RustCloud should intercept both and show a blocked-request count in F1 Settings, under Ad blocking.
 The requests are answered locally; they are not sent to those hosts.</p>
 <img src="https://ads.soundcloud.com/rustcloud-block-test.gif" alt="Blocked test request">
 <audio controls autoplay src="https://delivery-cdn-cf.adswizz.com/soundcloud_newEnco/ad_test.mp3"></audio>
 "#;
 
+    fn titlebar_bounds(window: &Window) -> Rect {
+        let size = window.inner_size().to_logical::<u32>(window.scale_factor());
+        Rect {
+            position: LogicalPosition::new(0, 0).into(),
+            size: LogicalSize::new(size.width, TITLEBAR_HEIGHT).into(),
+        }
+    }
+
+    fn page_bounds(window: &Window) -> Rect {
+        let size = window.inner_size().to_logical::<u32>(window.scale_factor());
+        Rect {
+            position: LogicalPosition::new(0, TITLEBAR_HEIGHT).into(),
+            size: LogicalSize::new(
+                size.width,
+                size.height.saturating_sub(TITLEBAR_HEIGHT).max(1),
+            )
+            .into(),
+        }
+    }
+
+    fn install_settings_shortcut(
+        webview: &WebView,
+        event_proxy: EventLoopProxy<UserEvent>,
+    ) -> windows::core::Result<()> {
+        const VK_F1: u32 = 0x70;
+
+        let controller = webview.controller();
+        let handler =
+            AcceleratorKeyPressedEventHandler::create(Box::new(move |_controller, args| {
+                if let Some(args) = args {
+                    let mut virtual_key = 0;
+                    if let Err(error) = unsafe { args.VirtualKey(&mut virtual_key) } {
+                        eprintln!("Could not read the WebView2 accelerator key: {error}");
+                        return Ok(());
+                    }
+                    if virtual_key != VK_F1 {
+                        return Ok(());
+                    }
+
+                    let mut key_event_kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+                    if let Err(error) = unsafe { args.KeyEventKind(&mut key_event_kind) } {
+                        eprintln!("Could not read the WebView2 accelerator event kind: {error}");
+                        return Ok(());
+                    }
+                    if key_event_kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                        && key_event_kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                    {
+                        return Ok(());
+                    }
+
+                    let mut key_status = COREWEBVIEW2_PHYSICAL_KEY_STATUS::default();
+                    let first_press = match unsafe { args.PhysicalKeyStatus(&mut key_status) } {
+                        Ok(()) => !key_status.WasKeyDown.as_bool(),
+                        Err(error) => {
+                            eprintln!("Could not read the WebView2 accelerator key state: {error}");
+                            true
+                        }
+                    };
+                    if let Err(error) = unsafe { args.SetHandled(true) } {
+                        eprintln!("Could not handle the F1 accelerator in WebView2: {error}");
+                        return Ok(());
+                    }
+                    if first_press {
+                        if let Err(error) = event_proxy.send_event(UserEvent::ToggleSettings) {
+                            eprintln!("Could not send the RustCloud settings shortcut: {error}");
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        let mut token = 0;
+        unsafe { controller.add_AcceleratorKeyPressed(&handler, &mut token) }
+    }
+
     enum UserEvent {
         RequestBlocked(usize),
+        WindowControl(WindowAction),
+        TitlebarAppearance { theme: String, accent: String },
+        ToggleSettings,
     }
 
     struct App {
         window: Option<Window>,
         webview: Option<WebView>,
+        titlebar_webview: Option<WebView>,
         block_test: bool,
         event_proxy: EventLoopProxy<UserEvent>,
         filter_engine: Arc<RwLock<Engine>>,
         settings: Arc<Mutex<AppSettings>>,
         blocking_enabled: Arc<AtomicBool>,
+        presence_sender: Sender<PresenceCommand>,
+        maximized: bool,
     }
 
     fn app_icon() -> Icon {
@@ -1531,7 +2344,9 @@ The requests are answered locally; they are not sent to those hosts.</p>
 
             let window = match event_loop.create_window(
                 Window::default_attributes()
-                    .with_title("RustCloud - network ad blocking enabled")
+                    .with_title("RustCloud")
+                    .with_decorations(false)
+                    .with_resizable(true)
                     .with_inner_size(LogicalSize::new(1200.0, 800.0))
                     .with_window_icon(Some(app_icon())),
             ) {
@@ -1559,15 +2374,32 @@ The requests are answered locally; they are not sent to those hosts.</p>
                     return;
                 }
             };
+            let titlebar_initialization_script = match titlebar_initialization_script(&settings) {
+                Ok(script) => script,
+                Err(error) => {
+                    eprintln!("Could not prepare the RustCloud title bar: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            };
             let shared_settings = Arc::clone(&self.settings);
             let blocking_enabled = Arc::clone(&self.blocking_enabled);
+            let presence_sender = self.presence_sender.clone();
+            let event_proxy = self.event_proxy.clone();
             let webview = match WebViewBuilder::new()
                 .with_initialization_script(initialization_script)
                 .with_ipc_handler(move |request| {
-                    handle_settings_message(request.body(), &shared_settings, &blocking_enabled);
+                    handle_settings_message(
+                        request.body(),
+                        &shared_settings,
+                        &blocking_enabled,
+                        &presence_sender,
+                        &event_proxy,
+                    );
                 })
                 .with_url("about:blank")
-                .build(&window)
+                .with_bounds(page_bounds(&window))
+                .build_as_child(&window)
             {
                 Ok(webview) => webview,
                 Err(error) => {
@@ -1576,6 +2408,9 @@ The requests are answered locally; they are not sent to those hosts.</p>
                     return;
                 }
             };
+            if let Err(error) = install_settings_shortcut(&webview, self.event_proxy.clone()) {
+                eprintln!("Could not install the RustCloud F1 shortcut: {error}");
+            }
 
             if let Err(error) = install_blocker(
                 &webview,
@@ -1599,16 +2434,133 @@ The requests are answered locally; they are not sent to those hosts.</p>
                 return;
             }
 
+            let titlebar_settings = Arc::clone(&self.settings);
+            let titlebar_blocking_enabled = Arc::clone(&self.blocking_enabled);
+            let titlebar_presence_sender = self.presence_sender.clone();
+            let titlebar_event_proxy = self.event_proxy.clone();
+            let titlebar_webview = match WebViewBuilder::new()
+                .with_initialization_script(titlebar_initialization_script)
+                .with_ipc_handler(move |request| {
+                    handle_settings_message(
+                        request.body(),
+                        &titlebar_settings,
+                        &titlebar_blocking_enabled,
+                        &titlebar_presence_sender,
+                        &titlebar_event_proxy,
+                    );
+                })
+                .with_html(TITLEBAR_HTML)
+                .with_bounds(titlebar_bounds(&window))
+                .build_as_child(&window)
+            {
+                Ok(webview) => webview,
+                Err(error) => {
+                    eprintln!("Could not create the RustCloud title bar: {error}");
+                    event_loop.exit();
+                    return;
+                }
+            };
+            if let Err(error) =
+                install_settings_shortcut(&titlebar_webview, self.event_proxy.clone())
+            {
+                eprintln!("Could not install the RustCloud F1 shortcut for the title bar: {error}");
+            }
+
             self.window = Some(window);
             self.webview = Some(webview);
+            self.titlebar_webview = Some(titlebar_webview);
         }
 
-        fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-            if let (Some(window), UserEvent::RequestBlocked(count)) = (&self.window, event) {
-                window.set_title(&format!(
-                    "RustCloud - {count} ad request{} blocked",
-                    if count == 1 { "" } else { "s" }
-                ));
+        fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+            match event {
+                UserEvent::RequestBlocked(count) => {
+                    if let Some(webview) = &self.webview {
+                        let script = format!(
+                            "window.__RUSTCLOUD_BLOCKED_COUNT__={count};\
+                            if (typeof window.__RUSTCLOUD_RENDER_BLOCKED_COUNT__ === 'function') \
+                            window.__RUSTCLOUD_RENDER_BLOCKED_COUNT__();"
+                        );
+                        if let Err(error) = webview.evaluate_script(&script) {
+                            eprintln!("Could not update the ad-blocking counter: {error}");
+                        }
+                    }
+                }
+                UserEvent::TitlebarAppearance { theme, accent } => {
+                    if let Some(webview) = &self.titlebar_webview {
+                        match serde_json::to_string(&[theme, accent]) {
+                            Ok(appearance) => {
+                                let script = format!(
+                                    "if (typeof window.__RUSTCLOUD_SET_APPEARANCE__ === 'function') \
+                                    window.__RUSTCLOUD_SET_APPEARANCE__({appearance}[0],{appearance}[1]);"
+                                );
+                                if let Err(error) = webview.evaluate_script(&script) {
+                                    eprintln!(
+                                        "Could not update the RustCloud title-bar theme: {error}"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Could not serialize the RustCloud title-bar theme: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+                UserEvent::ToggleSettings => {
+                    if let Some(webview) = &self.webview {
+                        let script =
+                            "if (typeof window.__RUSTCLOUD_TOGGLE_SETTINGS__ === 'function') \
+                            window.__RUSTCLOUD_TOGGLE_SETTINGS__();";
+                        if let Err(error) = webview.evaluate_script(script) {
+                            eprintln!("Could not toggle RustCloud settings with F1: {error}");
+                        }
+                    }
+                }
+                UserEvent::WindowControl(action) => match action {
+                    WindowAction::Minimize => {
+                        if let Some(window) = &self.window {
+                            window.set_minimized(true);
+                        }
+                    }
+                    WindowAction::ToggleMaximize => {
+                        if let Some(window) = &self.window {
+                            window.set_maximized(!window.is_maximized());
+                        }
+                    }
+                    WindowAction::Close => event_loop.exit(),
+                    WindowAction::Drag => {
+                        if let Some(window) = &self.window {
+                            if let Err(error) = window.drag_window() {
+                                eprintln!("Could not move the RustCloud window: {error}");
+                            }
+                        }
+                    }
+                    WindowAction::ResizeNorth => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::North)
+                    }
+                    WindowAction::ResizeNorthEast => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::NorthEast)
+                    }
+                    WindowAction::ResizeEast => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::East)
+                    }
+                    WindowAction::ResizeSouthEast => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::SouthEast)
+                    }
+                    WindowAction::ResizeSouth => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::South)
+                    }
+                    WindowAction::ResizeSouthWest => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::SouthWest)
+                    }
+                    WindowAction::ResizeWest => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::West)
+                    }
+                    WindowAction::ResizeNorthWest => {
+                        start_window_resize(self.window.as_ref(), ResizeDirection::NorthWest)
+                    }
+                },
             }
         }
 
@@ -1618,8 +2570,60 @@ The requests are answered locally; they are not sent to those hosts.</p>
             _window_id: WindowId,
             event: WindowEvent,
         ) {
-            if event == WindowEvent::CloseRequested {
-                event_loop.exit();
+            match event {
+                WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                    if let Some(window) = &self.window {
+                        if let Some(webview) = &self.webview {
+                            if let Err(error) = webview.set_bounds(page_bounds(window)) {
+                                eprintln!("Could not resize the SoundCloud page viewport: {error}");
+                            }
+                        }
+                        if let Some(webview) = &self.titlebar_webview {
+                            if let Err(error) = webview.set_bounds(titlebar_bounds(window)) {
+                                eprintln!("Could not resize the RustCloud title bar: {error}");
+                            }
+                        }
+                    }
+                    let maximized = self
+                        .window
+                        .as_ref()
+                        .is_some_and(|window| window.is_maximized());
+                    if maximized != self.maximized {
+                        self.maximized = maximized;
+                        if let Some(webview) = &self.webview {
+                            let script = format!(
+                                "if (typeof window.__RUSTCLOUD_SET_MAXIMIZED__ === 'function') \
+                                window.__RUSTCLOUD_SET_MAXIMIZED__({maximized});"
+                            );
+                            if let Err(error) = webview.evaluate_script(&script) {
+                                eprintln!(
+                                    "Could not update the title-bar maximize button: {error}"
+                                );
+                            }
+                        }
+                        if let Some(webview) = &self.titlebar_webview {
+                            let script = format!(
+                                "if (typeof window.__RUSTCLOUD_SET_MAXIMIZED__ === 'function') \
+                                window.__RUSTCLOUD_SET_MAXIMIZED__({maximized});"
+                            );
+                            if let Err(error) = webview.evaluate_script(&script) {
+                                eprintln!(
+                                    "Could not update the title-bar maximize button: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn start_window_resize(window: Option<&Window>, direction: ResizeDirection) {
+        if let Some(window) = window {
+            if let Err(error) = window.drag_resize_window(direction) {
+                eprintln!("Could not resize the RustCloud window: {error}");
             }
         }
     }
@@ -1798,6 +2802,7 @@ The requests are answered locally; they are not sent to those hosts.</p>
                 | "forest-glow"
                 | "rose-quartz"
                 | "ocean-breeze"
+                | "custom-glass"
         )
     }
 
@@ -1809,10 +2814,19 @@ The requests are answered locally; they are not sent to those hosts.</p>
         ))
     }
 
+    fn titlebar_initialization_script(settings: &AppSettings) -> Result<String, serde_json::Error> {
+        Ok(format!(
+            "window.__RUSTCLOUD_TITLEBAR_APPEARANCE__={};",
+            serde_json::to_string(&[&settings.theme, &settings.accent_color])?
+        ))
+    }
+
     fn handle_settings_message(
         raw_message: &str,
         settings: &Mutex<AppSettings>,
         blocking_enabled: &AtomicBool,
+        presence_sender: &Sender<PresenceCommand>,
+        event_proxy: &EventLoopProxy<UserEvent>,
     ) {
         let message = match serde_json::from_str::<SettingsMessage>(raw_message) {
             Ok(message) => message,
@@ -1821,6 +2835,27 @@ The requests are answered locally; they are not sent to those hosts.</p>
                 return;
             }
         };
+        if let SettingsMessage::WindowControl { action } = &message {
+            if let Err(error) = event_proxy.send_event(UserEvent::WindowControl(*action)) {
+                eprintln!("Could not send RustCloud window command: {error}");
+            }
+            return;
+        }
+        if let SettingsMessage::TrackUpdate { track } = &message {
+            if track.title.len() > 1024
+                || track.author.len() > 1024
+                || track.artwork.len() > 2048
+                || track.elapsed.len() > 32
+                || track.duration.len() > 32
+            {
+                eprintln!("Ignored invalid Discord Rich Presence track update.");
+                return;
+            }
+            if let Err(error) = presence_sender.send(PresenceCommand::Track(track.clone())) {
+                eprintln!("Could not send track data to Discord Rich Presence: {error}");
+            }
+            return;
+        }
 
         let mut settings = match settings.lock() {
             Ok(settings) => settings,
@@ -1829,6 +2864,7 @@ The requests are answered locally; they are not sent to those hosts.</p>
                 return;
             }
         };
+        let mut titlebar_appearance = None;
         match message {
             SettingsMessage::AdBlock { enabled } => {
                 settings.ad_block_enabled = enabled;
@@ -1844,6 +2880,7 @@ The requests are answered locally; they are not sent to those hosts.</p>
                     return;
                 }
                 settings.accent_color = color;
+                titlebar_appearance = Some((settings.theme.clone(), settings.accent_color.clone()));
             }
             SettingsMessage::Theme { name } => {
                 if !is_valid_theme(&name) {
@@ -1851,6 +2888,7 @@ The requests are answered locally; they are not sent to those hosts.</p>
                     return;
                 }
                 settings.theme = name;
+                titlebar_appearance = Some((settings.theme.clone(), settings.accent_color.clone()));
             }
             SettingsMessage::CoverGlow { enabled } => {
                 settings.cover_glow_enabled = enabled;
@@ -1858,8 +2896,24 @@ The requests are answered locally; they are not sent to those hosts.</p>
             SettingsMessage::FullPlaylistShuffle { enabled } => {
                 settings.full_playlist_shuffle_enabled = enabled;
             }
+            SettingsMessage::DiscordRichPresence { enabled } => {
+                settings.discord_rich_presence_enabled = enabled;
+                if let Err(error) = presence_sender.send(PresenceCommand::SetEnabled(enabled)) {
+                    eprintln!("Could not update Discord Rich Presence setting: {error}");
+                }
+            }
+            SettingsMessage::TrackUpdate { .. } => unreachable!(),
+            SettingsMessage::WindowControl { .. } => unreachable!(),
         }
         save_settings(&settings);
+        drop(settings);
+        if let Some((theme, accent)) = titlebar_appearance {
+            if let Err(error) =
+                event_proxy.send_event(UserEvent::TitlebarAppearance { theme, accent })
+            {
+                eprintln!("Could not send the RustCloud title-bar theme update: {error}");
+            }
+        }
     }
 
     fn filter_list_cache_path() -> Option<PathBuf> {
@@ -1974,11 +3028,17 @@ The requests are answered locally; they are not sent to those hosts.</p>
 
     pub fn run() -> Result<(), Box<dyn Error>> {
         let settings = Arc::new(Mutex::new(load_settings()));
-        let saved_ad_block_enabled = settings
-            .lock()
-            .map_err(|error| format!("Could not read RustCloud settings: {error}"))?
-            .ad_block_enabled;
+        let (saved_ad_block_enabled, discord_presence_enabled) = {
+            let settings = settings
+                .lock()
+                .map_err(|error| format!("Could not read RustCloud settings: {error}"))?;
+            (
+                settings.ad_block_enabled,
+                settings.discord_rich_presence_enabled,
+            )
+        };
         let blocking_enabled = Arc::new(AtomicBool::new(saved_ad_block_enabled));
+        let presence_sender = spawn_presence_worker(discord_presence_enabled)?;
         let (cached_lists, cache_is_stale) = cached_filter_lists();
         let filter_engine = Arc::new(RwLock::new(match cached_lists {
             Some(contents) => {
@@ -2006,14 +3066,46 @@ The requests are answered locally; they are not sent to those hosts.</p>
         let mut app = App {
             window: None,
             webview: None,
+            titlebar_webview: None,
             block_test: std::env::args().any(|arg| arg == "--block-test"),
             event_proxy,
             filter_engine,
             settings,
             blocking_enabled,
+            presence_sender,
+            maximized: false,
         };
         event_loop.run_app(&mut app)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{parse_time_millis, presence_timestamps_at, PlaybackTrack};
+
+        #[test]
+        fn parses_elapsed_and_remaining_track_times() {
+            assert_eq!(parse_time_millis("1:02:03"), Some(3_723_000));
+            assert_eq!(parse_time_millis("-2:10"), Some(-130_000));
+            assert_eq!(parse_time_millis(""), None);
+            assert_eq!(parse_time_millis("not-a-time"), None);
+        }
+
+        #[test]
+        fn creates_discord_timestamps_in_milliseconds() {
+            let track = PlaybackTrack {
+                title: String::from("Title"),
+                author: String::from("Artist"),
+                artwork: String::new(),
+                elapsed: String::from("1:15"),
+                duration: String::from("3:00"),
+                is_playing: true,
+            };
+            assert_eq!(
+                presence_timestamps_at(&track, 10_000_000),
+                Some((9_925_000, 10_105_000))
+            );
+        }
     }
 }
 
