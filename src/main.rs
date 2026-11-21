@@ -857,6 +857,18 @@ mod desktop {
                     background:transparent; text-align:left; cursor:pointer;
                 }
                 .library-item:hover { background:#ffffff10; color:#fff; }
+                .library-item-row {
+                    display:flex; align-items:center; gap:5px; border-radius:9px;
+                }
+                .library-item-row:hover { background:#ffffff08; }
+                .library-item-row .library-item { flex:1; min-width:0; }
+                .library-pin {
+                    width:28px; height:28px; flex:none; padding:0;
+                    border:0; border-radius:50%; color:#85858e;
+                    background:transparent; cursor:pointer; font-size:14px;
+                }
+                .library-pin:hover { color:#fff; background:#ffffff10; }
+                .library-pin.pinned { color:var(--accent); }
                 .library-item img, .library-art-placeholder {
                     width:42px; height:42px; flex:none; border-radius:6px;
                     object-fit:cover; background:#ffffff12;
@@ -1349,6 +1361,8 @@ mod desktop {
         let shuffleStatusTimer = null;
         let libraryItems = [];
         let libraryLoadPromise = null;
+        const playlistPinsKey = 'rustcloud.playlist-pins.v1';
+        let pinnedPlaylistUrls = new Set();
 
         window.__RUSTCLOUD_SHUFFLE_NOTIFY__ = message => {
             shuffleStatus.textContent = message;
@@ -1565,8 +1579,18 @@ mod desktop {
             const filtered = libraryItems.filter(item => item.title.toLocaleLowerCase().includes(query));
             playlistItemsElement.replaceChildren();
 
-            for (const [kind, label] of [['created', 'Your playlists'], ['saved', 'Liked playlists']]) {
-                const items = filtered.filter(item => item.kind === kind);
+            const pinned = filtered.filter(item => pinnedPlaylistUrls.has(item.url));
+            const groups = [
+                ['pinned', 'Pinned', pinned],
+                ['created', 'Your playlists', filtered.filter(item =>
+                    item.kind === 'created' && !pinnedPlaylistUrls.has(item.url)
+                )],
+                ['saved', 'Liked playlists', filtered.filter(item =>
+                    item.kind === 'saved' && !pinnedPlaylistUrls.has(item.url)
+                )]
+            ];
+
+            for (const [kind, label, items] of groups) {
                 if (!items.length) continue;
 
                 const group = document.createElement('section');
@@ -1577,6 +1601,8 @@ mod desktop {
                 group.appendChild(heading);
 
                 for (const item of items) {
+                    const row = document.createElement('div');
+                    row.className = 'library-item-row';
                     const button = document.createElement('button');
                     button.className = 'library-item';
                     button.type = 'button';
@@ -1586,6 +1612,7 @@ mod desktop {
                         image.src = item.artwork;
                         image.alt = '';
                         image.loading = 'lazy';
+                        image.referrerPolicy = 'no-referrer';
                         button.appendChild(image);
                     } else {
                         const placeholder = document.createElement('span');
@@ -1603,7 +1630,35 @@ mod desktop {
                         const url = new URL(item.url, window.location.origin);
                         if (url.origin === window.location.origin) window.location.assign(url.href);
                     });
-                    group.appendChild(button);
+                    row.appendChild(button);
+
+                    const pin = document.createElement('button');
+                    pin.className = 'library-pin';
+                    pin.type = 'button';
+                    pin.classList.toggle('pinned', pinnedPlaylistUrls.has(item.url));
+                    pin.textContent = pinnedPlaylistUrls.has(item.url) ? '◆' : '◇';
+                    pin.title = pinnedPlaylistUrls.has(item.url) ? 'Unpin playlist' : 'Pin playlist';
+                    pin.setAttribute('aria-label',
+                        `${pinnedPlaylistUrls.has(item.url) ? 'Unpin' : 'Pin'} playlist ${item.title}`
+                    );
+                    pin.addEventListener('click', event => {
+                        event.stopPropagation();
+                        if (pinnedPlaylistUrls.has(item.url)) {
+                            pinnedPlaylistUrls.delete(item.url);
+                        } else {
+                            pinnedPlaylistUrls.add(item.url);
+                        }
+                        try {
+                            localStorage.setItem(playlistPinsKey,
+                                JSON.stringify([...pinnedPlaylistUrls])
+                            );
+                        } catch (error) {
+                            console.warn('[RustCloud] Could not save pinned playlists:', error);
+                        }
+                        renderLibrary();
+                    });
+                    row.appendChild(pin);
+                    group.appendChild(row);
                 }
                 playlistItemsElement.appendChild(group);
             }
@@ -1658,7 +1713,31 @@ mod desktop {
                     ].map(value => (value || '').trim()).find(Boolean) || '';
                     const key = `${url.origin}${url.pathname.replace(/\/$/, '')}`;
                     if (!title || results.has(key)) continue;
-                    const artwork = image && (image.currentSrc || image.src);
+                    let artwork = '';
+                    const row = link.closest('.soundList__item, .userStreamItem, li, article') || link;
+                    const candidates = [
+                        link.querySelector('img[src], img[data-src], img[srcset], picture source[srcset]'),
+                        row.querySelector('img[src], img[data-src], img[srcset], picture source[srcset]'),
+                        ...row.querySelectorAll('[style*="background-image"]')
+                    ];
+                    for (const candidate of candidates) {
+                        if (!candidate) continue;
+                        if (candidate.matches && candidate.matches('source')) {
+                            artwork = candidate.srcset || candidate.getAttribute('srcset') || '';
+                        } else if (candidate.style && candidate.style.backgroundImage) {
+                            const match = candidate.style.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/);
+                            artwork = match ? match[1] : '';
+                        } else {
+                            artwork =
+                                candidate.currentSrc ||
+                                candidate.dataset.src ||
+                                candidate.src ||
+                                candidate.getAttribute('srcset') ||
+                                '';
+                            if (artwork.includes(',')) artwork = artwork.split(',')[0].trim().split(/\s+/)[0];
+                        }
+                        if (artwork) break;
+                    }
                     results.set(key, {
                         kind,
                         title,
@@ -1807,6 +1886,17 @@ mod desktop {
         setCustomFont(settings.custom_font);
         applyTheme(settings.theme, false);
         libraryItems = readPlaylistCache();
+        try {
+            const pinned = JSON.parse(localStorage.getItem(playlistPinsKey) || '[]');
+            if (Array.isArray(pinned)) {
+                pinnedPlaylistUrls = new Set(pinned.filter(url =>
+                    typeof url === 'string' &&
+                    /^https:\/\/soundcloud\.com\/[^/]+\/sets\/[^/]+/.test(url)
+                ));
+            }
+        } catch (error) {
+            console.warn('[RustCloud] Could not read pinned playlists:', error);
+        }
         if (libraryItems.length) renderLibrary();
         libraryLauncher.addEventListener('click', () => {
             setLibraryOpen(!libraryPanel.classList.contains('open'));
