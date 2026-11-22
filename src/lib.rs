@@ -1,102 +1,108 @@
-use url::Url;
+use adblock::{
+    lists::{FilterSet, ParseOptions},
+    request::Request,
+    Engine,
+};
 
-const AD_DOMAINS: &[&str] = &[
-    "ads.soundcloud.com",
-    "ads.scdn.co",
-    "doubleclick.net",
-    "googlesyndication.com",
-    "googleadservices.com",
-    "adservice.google.com",
-    "amazon-adsystem.com",
-    "adnxs.com",
-    "adsrvr.org",
-    "criteo.com",
-    "taboola.com",
-    "outbrain.com",
-];
+const LOCAL_FILTERS: &str = r#"
+||ads.soundcloud.com^
+||ads.scdn.co^
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||adservice.google.com^
+||amazon-adsystem.com^
+||adnxs.com^
+||adsrvr.org^
+||criteo.com^
+||taboola.com^
+||outbrain.com^
+||api.soundcloud.com/ads^
+||api-v2.soundcloud.com/ads^
+||delivery-cdn-cf.adswizz.com/soundcloud_newEnco/ad_*.mp3$media
+"#;
 
-pub fn blocked_reason(raw_url: &str) -> Option<&'static str> {
-    let url = Url::parse(raw_url).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
+pub fn build_filter_engine(filter_lists: impl IntoIterator<Item = String>) -> Engine {
+    let mut filter_set = FilterSet::new(false);
+    filter_set.add_filter_list(LOCAL_FILTERS.to_owned(), ParseOptions::default());
+    for list in filter_lists {
+        filter_set.add_filter_list(list, ParseOptions::default());
     }
+    Engine::new_with_filter_set(filter_set)
+}
 
-    let host = url.host_str()?;
-    if AD_DOMAINS.iter().any(|domain| {
-        host == *domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    }) {
-        return Some("known advertising domain");
-    }
-
-    if matches!(host, "api.soundcloud.com" | "api-v2.soundcloud.com")
-        && matches!(url.path(), "/ads" | "/ads/")
-    {
-        return Some("SoundCloud ad API");
-    }
-
-    None
+pub fn should_block(engine: &Engine, raw_url: &str, source_url: &str, request_type: &str) -> bool {
+    let Ok(request) = Request::new(raw_url, source_url, request_type, "GET") else {
+        return false;
+    };
+    engine.check_network_request(&request).should_block()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::blocked_reason;
+    use super::{build_filter_engine, should_block};
+
+    const SOURCE: &str = "https://soundcloud.com/";
 
     #[test]
-    fn blocks_soundcloud_ad_domains_and_subdomains() {
-        assert_eq!(
-            blocked_reason("https://ads.soundcloud.com/slot"),
-            Some("known advertising domain")
-        );
-        assert_eq!(
-            blocked_reason("https://cdn.ads.scdn.co/banner"),
-            Some("known advertising domain")
-        );
+    fn blocks_known_soundcloud_ad_audio_but_not_other_audio() {
+        let engine = build_filter_engine([]);
+
+        assert!(should_block(
+            &engine,
+            "https://delivery-cdn-cf.adswizz.com/soundcloud_newEnco/ad_test.mp3",
+            SOURCE,
+            "media"
+        ));
+        assert!(!should_block(
+            &engine,
+            "https://delivery-cdn-cf.adswizz.com/soundcloud_newEnco/track.mp3",
+            SOURCE,
+            "media"
+        ));
     }
 
     #[test]
-    fn blocks_ad_domain_suffixes_without_matching_lookalikes() {
-        assert_eq!(
-            blocked_reason("https://pagead2.googlesyndication.com/impression"),
-            Some("known advertising domain")
-        );
-        assert_eq!(blocked_reason("https://notdoubleclick.net/ad"), None);
-        assert_eq!(
-            blocked_reason("https://doubleclick.net.attacker.example/ad"),
-            None
-        );
+    fn applies_filter_lists_and_their_exceptions() {
+        let engine = build_filter_engine([String::from(
+            "||example.test^$media\n@@||example.test/allowed.mp3$media",
+        )]);
+
+        assert!(should_block(
+            &engine,
+            "https://example.test/ad.mp3",
+            SOURCE,
+            "media"
+        ));
+        assert!(!should_block(
+            &engine,
+            "https://example.test/allowed.mp3",
+            SOURCE,
+            "media"
+        ));
     }
 
     #[test]
-    fn blocks_only_soundcloud_ad_api_paths() {
-        assert_eq!(
-            blocked_reason("https://api-v2.soundcloud.com/ads"),
-            Some("SoundCloud ad API")
-        );
-        assert_eq!(
-            blocked_reason("https://api.soundcloud.com/ads/"),
-            Some("SoundCloud ad API")
-        );
-        assert_eq!(
-            blocked_reason("https://api-v2.soundcloud.com/users/ads"),
-            None
-        );
-        assert_eq!(
-            blocked_reason("https://api-v2.soundcloud.com/ads/list"),
-            None
-        );
-    }
+    fn matches_supported_ad_domains_and_soundcloud_ad_api() {
+        let engine = build_filter_engine([]);
 
-    #[test]
-    fn ignores_invalid_and_non_web_urls() {
-        assert_eq!(blocked_reason("not a URL"), None);
-        assert_eq!(blocked_reason("file:///ads.soundcloud.com/slot"), None);
-    }
-
-    #[test]
-    fn recognizes_the_manual_blocking_demo_request() {
-        assert!(blocked_reason("https://ads.soundcloud.com/rustcloud-block-test.gif").is_some());
+        assert!(should_block(
+            &engine,
+            "https://cdn.ads.scdn.co/banner",
+            SOURCE,
+            "image"
+        ));
+        assert!(should_block(
+            &engine,
+            "https://api-v2.soundcloud.com/ads",
+            SOURCE,
+            "fetch"
+        ));
+        assert!(!should_block(
+            &engine,
+            "https://api-v2.soundcloud.com/users/ads",
+            SOURCE,
+            "fetch"
+        ));
     }
 }
